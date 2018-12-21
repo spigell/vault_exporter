@@ -1,8 +1,12 @@
 package main
 
 import (
+	"os"
+	"time"
+	"io/ioutil"
 	"net/http"
 	_ "net/http/pprof"
+
 
 	vault_api "github.com/hashicorp/vault/api"
 	"github.com/prometheus/client_golang/prometheus"
@@ -10,9 +14,11 @@ import (
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/yaml.v2"
 )
 
 var (
+	config = kingpin.Flag("config", "path to config file").Default("/etc/vault_exporter.yml").String()
 	listenAddress = kingpin.Flag("web.listen-address",
 		"Address to listen on for web interface and telemetry.").
 		Default(":9410").String()
@@ -60,17 +66,29 @@ var (
 		"Version of this Vault node.",
 		[]string{"version", "cluster_name", "cluster_id"}, nil,
 	)
+	tokenStatus = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "tokens_time_of_expire"),
+		"Expire time for token by accessor id",
+		[]string{"accessor_id"}, nil,
+	)
 )
 
 // Exporter collects Vault health from the given server and exports them using
 // the Prometheus metrics package.
 type Exporter struct {
 	client *vault_api.Client
+	Config *Config
 }
 
+type Config struct {
+	AccessorIds    []string `yaml:accessorids`
+}
+
+
 // NewExporter returns an initialized Exporter.
-func NewExporter() (*Exporter, error) {
+func NewExporter(c *Config) (*Exporter, error) {
 	vaultConfig := vault_api.DefaultConfig()
+
 
 	if *sslInsecure {
 		tlsconfig := &vault_api.TLSConfig{
@@ -103,6 +121,7 @@ func NewExporter() (*Exporter, error) {
 
 	return &Exporter{
 		client: client,
+		Config: c,
 	}, nil
 }
 
@@ -114,6 +133,7 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- sealed
 	ch <- standby
 	ch <- info
+	ch <- tokenStatus
 }
 
 func bool2float(b bool) float64 {
@@ -125,7 +145,55 @@ func bool2float(b bool) float64 {
 
 // Collect fetches the stats from configured Vault and delivers them
 // as Prometheus metrics. It implements prometheus.Collector.
+func (e *Exporter) checkTokens ( accessorId string) ( float64, error ) {
+
+	data, err := e.client.Auth().Token().LookupAccessor(accessorId)
+
+	if err != nil {
+		return 0, err
+	}
+
+	metadata := data.Data
+	ex := metadata["expire_time"]
+
+	str := ex.(string)
+		t, errStr := time.Parse(time.RFC3339, str)
+
+	if errStr != nil {
+		return 0, err
+	}
+
+	timestamp := float64(t.Unix())
+
+        return timestamp, nil
+}
+
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
+
+	if os.Getenv("VAULT_TOKEN") != "" {
+
+		e.client.SetToken(os.Getenv("VAULT_TOKEN"))
+
+		accessorIds := e.Config.AccessorIds
+
+		for _, accessorId := range accessorIds {
+			timestamp, err := e.checkTokens(accessorId)
+
+			if err != nil {
+				log.Errorf("Get info AccessorId `%s` failed. Error: %s", accessorId, err)
+				ch <- prometheus.MustNewConstMetric(
+					tokenStatus, prometheus.GaugeValue, 0, accessorId,
+				)
+				continue
+			}
+
+			ch <- prometheus.MustNewConstMetric(
+				tokenStatus, prometheus.GaugeValue, timestamp, accessorId,
+			)
+		}
+
+	}
+
 	health, err := e.client.Sys().Health()
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(
@@ -150,6 +218,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(
 		info, prometheus.GaugeValue, 1, health.Version, health.ClusterName, health.ClusterID,
 	)
+
 }
 
 func init() {
@@ -165,7 +234,24 @@ func main() {
 	log.Infoln("Starting vault_exporter", version.Info())
 	log.Infoln("Build context", version.BuildContext())
 
-	exporter, err := NewExporter()
+	file, err := os.Open(*config)
+        if err != nil {
+                log.Fatalln(err2)
+        }
+
+	configuration := Config{}
+	target, err := ioutil.ReadAll(file)
+
+        if err != nil {
+                log.Fatalln(err)
+        }
+
+	if err := yaml.Unmarshal(target, &configuration); err != nil {
+
+                log.Fatalln(err)
+	}
+
+	exporter, err := NewExporter(&configuration)
 	if err != nil {
 		log.Fatalln(err)
 	}
