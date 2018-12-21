@@ -236,7 +236,7 @@ func main() {
 
 	file, err := os.Open(*config)
         if err != nil {
-                log.Fatalln(err2)
+                log.Fatalln(err)
         }
 
 	configuration := Config{}
